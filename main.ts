@@ -157,6 +157,7 @@ function forecast(input: ForecastCase) {
     population.fit.span / (population.fit.span + 0.5);
   const populationDrift = clamp(populationStrength * population.fit.slope +
     (1 - populationStrength) * typicalPrior, -2, 4);
+  const reversionStrength = 0.035 * populationStrength;
   const trendMemory = Math.max(5, span * 2);
   const growthMemory = Math.max(7, span * 2);
 
@@ -179,7 +180,7 @@ function forecast(input: ForecastCase) {
     const dt = elapsed / steps;
     let z = fit.count ? fit.intercept : logit(0.01);
     let center = population.fit.count ? population.fit.intercept : logit(0.1);
-    // Align the population reference with a trophy whose last valid rate is older.
+    // Start the population reference at the trophy's latest valid observation time.
     if (curve.last < population.last) {
       center -= population.fit.slope * (population.last - curve.last);
     }
@@ -189,7 +190,7 @@ function forecast(input: ForecastCase) {
       const dilution = growth * Math.exp(-futureAge / growthMemory);
       const fadingDrift = prior + (intrinsicDrift - prior) * Math.exp(-age / trendMemory);
       const gap = center - z;
-      const reversion = 0.035 * gap / (1 + Math.abs(gap));
+      const reversion = reversionStrength * gap / (1 + Math.abs(gap));
       z = advance(z, fadingDrift + reversion, dilution, dt);
       center = advance(center, populationDrift, dilution, dt);
     }
