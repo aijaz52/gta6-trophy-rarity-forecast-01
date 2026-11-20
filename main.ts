@@ -1,137 +1,244 @@
-// Deterministic, history-only GTA trophy rarity forecaster (Node 22, stdlib only).
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readdir, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-const clamp = (x: number, lo = 0.01, hi = 99.99): number => Math.min(hi, Math.max(lo, x));
-const logit = (pct: number): number => { const p = clamp(pct); return Math.log(p / (100 - p)); };
-const logistic = (x: number): number => 100 / (1 + Math.exp(-Math.max(-30, Math.min(30, x))));
-const round4 = (x: number): number => Math.round(Math.max(0, Math.min(100, x)) * 10_000) / 10_000;
+// Run directly with Node 22. No packages, training files, or random state.
+type Trophy = { id: number; tier?: string; secret?: boolean };
+type Snapshot = {
+  slot?: number; at: string; players_tracked: number; rates: (number | null)[];
+};
+type ForecastCase = {
+  schema: string; id: unknown; at: string; horizon_minutes: number;
+  target?: string; trophies: Trophy[]; history: Snapshot[];
+};
+type Point = { t: number; y: number; weight: number; noise: number };
+type Line = {
+  slope: number; intercept: number; residualVariance: number;
+  slopeVariance: number; span: number; count: number; cadence: number;
+};
+type Curve = { last: number; fit: Line; samplingVariance: number };
 
-interface Trophy { id: number; tier?: string; points?: number; secret?: boolean; }
-interface Read { at: string; players_tracked: number; trophies_earned: number; rates: Array<number | null>; }
-interface Case { levels: number[]; horizon_minutes: number; trophies: Trophy[]; history: Read[]; }
-interface Observation { t: number; y: number; raw: number; players: number; earned: number; }
 const DAY = 86_400_000;
+const EPSILON = 1e-8;
+const NORMAL_QUANTILES = [-1.64485362695147, -0.674489750196082, 0,
+  0.674489750196082, 1.64485362695147];
+const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
+const logit = (p: number) => Math.log(clamp(p, EPSILON, 1 - EPSILON) /
+  (1 - clamp(p, EPSILON, 1 - EPSILON)));
+const logistic = (z: number) => z >= 0 ? 1 / (1 + Math.exp(-z)) :
+  Math.exp(z) / (1 + Math.exp(z));
+const median = (values: number[]) => {
+  if (!values.length) return 0;
+  const ordered = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2;
+};
 
-function elapsedDays(a: string, b: string): number {
-  const x = Date.parse(a), y = Date.parse(b);
-  return Number.isFinite(x) && Number.isFinite(y) ? Math.max(0, (y - x) / DAY) : 0;
-}
-function weightedMedian(xs: Array<{ value: number; weight: number }>): number {
-  const a = xs.filter((x) => Number.isFinite(x.value) && x.weight > 0).sort((x, y) => x.value - y.value);
-  const total = a.reduce((s, x) => s + x.weight, 0);
-  let n = 0;
-  for (const x of a) { n += x.weight; if (n >= total / 2) return x.value; }
-  return a.length ? a[a.length - 1].value : 0;
-}
-
-function prior(t: Trophy): { speed: number; secret: number; floor: number; ceiling: number } {
-  const tier = (t.tier ?? '').toLowerCase();
-  const points = Number.isFinite(t.points) ? t.points! : 20;
-  const speed = tier.includes('bronze') ? 1.2 : tier.includes('platinum') || tier.includes('gold') ? 0.66 : tier.includes('silver') ? 0.9 : points <= 15 ? 1.15 : points >= 75 ? 0.68 : 0.86;
-  return { speed, secret: t.secret ? 0.72 : 1, floor: t.secret ? 0.00012 : 0.00038, ceiling: t.secret ? 0.000025 : 0.00005 };
-}
-
-function forecast(c: Case): Array<{ id: number; q: number[] }> {
-  if (c.levels.length !== LEVELS.length || c.levels.some((v, i) => v !== LEVELS[i])) throw new Error(`Expected levels ${JSON.stringify(LEVELS)}`);
-  if (!c.history.length) throw new Error('Case has no history');
-  const horizon = Math.max(0, c.horizon_minutes / 1440);
-  const elapsed = c.history.map((r, i) => i ? elapsedDays(c.history[0].at, r.at) : 0);
-  const latest = elapsed[elapsed.length - 1];
-  const series: Observation[][] = c.trophies.map((_, i) => c.history.flatMap((r, j) => {
-    const raw = r.rates[i];
-    return raw == null || !Number.isFinite(raw) ? [] : [{ t: elapsed[j], y: logit(raw), raw: clamp(raw), players: Math.max(1, r.players_tracked || 1), earned: Math.max(0, r.trophies_earned || 0) }];
-  }));
-
-  // Median logit trend across trophies is the case's launch-curve shape.
-  const popSteps: Array<{ value: number; weight: number }> = [];
-  for (let j = 1; j < c.history.length; j++) {
-    const dt = elapsed[j] - elapsed[j - 1];
-    if (dt <= 0) continue;
-    const changes: number[] = [];
-    for (const s of series) {
-      const a = s.find((o) => o.t === elapsed[j - 1]), b = s.find((o) => o.t === elapsed[j]);
-      if (a && b) changes.push((b.y - a.y) / dt);
-    }
-    if (changes.length) {
-      changes.sort((a, b) => a - b);
-      popSteps.push({ value: changes[Math.floor(changes.length / 2)], weight: Math.exp(-(latest - elapsed[j]) / 35) * Math.sqrt(changes.length) });
+// Weighted robust regression in days, centered on the most recent observation.
+function fitLine(points: Point[]): Line {
+  if (points.length < 2) {
+    return { slope: 0, intercept: points[0]?.y ?? 0, residualVariance: 0,
+      slopeVariance: 0.25, span: 0, count: points.length, cadence: 1 };
+  }
+  const weights = points.map(p => p.weight);
+  let slope = 0;
+  let intercept = 0;
+  let spread = 0;
+  let sumWeight = 0;
+  for (let pass = 0; pass < 3; pass++) {
+    sumWeight = weights.reduce((sum, w) => sum + w, 0);
+    const meanT = points.reduce((sum, p, i) => sum + weights[i] * p.t, 0) / sumWeight;
+    const meanY = points.reduce((sum, p, i) => sum + weights[i] * p.y, 0) / sumWeight;
+    spread = points.reduce((sum, p, i) => sum + weights[i] * (p.t - meanT) ** 2, 0);
+    slope = spread > 1e-12 ? points.reduce((sum, p, i) =>
+      sum + weights[i] * (p.t - meanT) * (p.y - meanY), 0) / spread : 0;
+    intercept = meanY - slope * meanT;
+    const errors = points.map(p => Math.abs(p.y - intercept - slope * p.t));
+    const scale = Math.max(0.015, median(errors) * 1.4826);
+    for (let i = 0; i < weights.length; i++) {
+      weights[i] = points[i].weight * Math.min(1, 1.5 * scale / Math.max(errors[i], 1e-12));
     }
   }
-  const populationSlope = weightedMedian(popSteps);
-  const growths: Array<{ value: number; weight: number }> = [];
-  for (let j = 1; j < c.history.length; j++) {
-    const dt = elapsed[j] - elapsed[j - 1], a = c.history[j - 1], b = c.history[j];
-    if (dt > 0 && a.players_tracked > 0 && b.players_tracked > 0)
-      growths.push({ value: Math.max(-0.02, Math.min(0.1, Math.log(b.players_tracked / a.players_tracked) / dt)), weight: Math.exp(-(latest - elapsed[j]) / 35) });
+  const residualVariance = points.reduce((sum, p) =>
+    sum + p.weight * (p.y - intercept - slope * p.t) ** 2, 0) /
+    points.reduce((sum, p) => sum + p.weight, 0) * points.length / Math.max(1, points.length - 2);
+  const sampling = points.reduce((sum, p) => sum + p.noise, 0) / points.length;
+  const span = points[points.length - 1].t - points[0].t;
+  const intervals = points.slice(1).map((p, i) => p.t - points[i].t).filter(x => x > 0);
+  return { slope, intercept, residualVariance,
+    slopeVariance: Math.max(residualVariance, sampling, 0.0001) /
+      Math.max(0.001, spread / Math.max(sumWeight, 1e-12) * points.length),
+    span, count: points.length, cadence: Math.max(1 / 1440, median(intervals) || 1) };
+}
+
+function driftPrior(trophy: Trophy): number {
+  const tier = String(trophy.tier ?? '').toLowerCase();
+  const base = ({ bronze: 0.18, silver: 0.12, gold: 0.075, platinum: 0.035 } as
+    Record<string, number>)[tier] ?? 0.12;
+  return base * (trophy.secret ? 0.82 : 1);
+}
+
+function validate(input: ForecastCase): void {
+  if (input?.schema !== 'makefun/gta6-trophies-case/v1') throw new Error('Unsupported case schema');
+  if (!Array.isArray(input.trophies) || !Array.isArray(input.history)) {
+    throw new Error('Expected trophies and history arrays');
   }
-  const playerGrowth = weightedMedian(growths);
-  const last = c.history[c.history.length - 1];
+  if (!Number.isFinite(input.horizon_minutes) || input.horizon_minutes < 0 ||
+      !Number.isFinite(Date.parse(input.at))) throw new Error('Invalid forecast time or horizon');
+  const ids = new Set<number>();
+  for (const trophy of input.trophies) {
+    if (!Number.isSafeInteger(trophy.id) || ids.has(trophy.id)) throw new Error('Invalid or duplicate trophy id');
+    ids.add(trophy.id);
+  }
+  for (const row of input.history) {
+    if (!Number.isFinite(Date.parse(row.at)) || !Number.isFinite(row.players_tracked) ||
+        row.players_tracked <= 0 || !Array.isArray(row.rates)) throw new Error('Invalid history row');
+  }
+}
 
-  return c.trophies.map((t, i) => {
-    const obs = series[i], raw = last.rates[i];
-    const current = raw != null && Number.isFinite(raw) ? clamp(raw) : obs[obs.length - 1]?.raw ?? 0.01;
-    let slope = 0, residual = 0.5, reliability = 0;
-    if (obs.length >= 2) {
-      const weights = obs.map((o) => Math.exp(-(latest - o.t) / 35));
-      const sw = weights.reduce((a, b) => a + b, 0);
-      const mx = obs.reduce((s, o, j) => s + weights[j] * o.t, 0) / sw;
-      const my = obs.reduce((s, o, j) => s + weights[j] * o.y, 0) / sw;
-      const sxx = obs.reduce((s, o, j) => s + weights[j] * (o.t - mx) ** 2, 0);
-      const sxy = obs.reduce((s, o, j) => s + weights[j] * (o.t - mx) * (o.y - my), 0);
-      const rawSlope = sxx > 1e-8 ? sxy / sxx : 0;
-      const increments: Array<{ value: number; weight: number }> = [];
-      for (let j = 1; j < obs.length; j++) {
-        const dt = obs[j].t - obs[j - 1].t;
-        if (dt > 0) increments.push({ value: (obs[j].y - obs[j - 1].y - rawSlope * dt) / Math.sqrt(dt), weight: Math.exp(-(latest - obs[j].t) / 35) });
-      }
-      if (increments.length) {
-        const iw = increments.reduce((s, x) => s + x.weight, 0);
-        residual = Math.sqrt(increments.reduce((s, x) => s + x.weight * x.value ** 2, 0) / iw);
-      }
-      const span = Math.max(0, obs[obs.length - 1].t - obs[0].t);
-      reliability = Math.min(0.88, (obs.length - 1) / (obs.length + 2) * span / (span + 7)) / (1 + (residual / 0.8) ** 2);
-      slope = rawSlope * reliability;
-    }
+function forecast(input: ForecastCase) {
+  validate(input);
+  const origin = Date.parse(input.at);
+  const horizon = input.horizon_minutes / 1440;
+  // Ignore future observations and collapse duplicate timestamps deterministically.
+  const rowsByTime = new Map<number, Snapshot>();
+  for (const row of input.history) {
+    const stamp = Date.parse(row.at);
+    if (stamp <= origin) rowsByTime.set(stamp, row);
+  }
+  const rows = [...rowsByTime.entries()].sort((a, b) => a[0] - b[0])
+    .map(([stamp, row]) => ({ ...row, t: (stamp - origin) / DAY }));
+  const span = rows.length > 1 ? rows[rows.length - 1].t - rows[0].t : 0;
+  const decayWindow = Math.max(1, span * 0.65);
+  const lastTime = rows[rows.length - 1]?.t ?? 0;
+  const weightAt = (t: number) => Math.exp((t - lastTime) / decayWindow);
+  const populationSizes = rows.map(row => ({ t: row.t - lastTime,
+    y: Math.log(row.players_tracked), weight: weightAt(row.t), noise: 0 }));
+  const growthFit = fitLine(populationSizes);
+  const recentGrowthFit = fitLine(populationSizes.slice(-Math.max(3, Math.ceil(rows.length / 2))));
+  const growth = clamp(0.4 * growthFit.slope + 0.6 * recentGrowthFit.slope, -0.5, 2);
 
-    // Correct observed changes for the lag between new tracked players and earned trophies.
-    const lagSamples: Array<{ value: number; weight: number }> = [];
-    for (let j = 1; j < obs.length; j++) {
-      const growth = Math.log(obs[j].players / obs[j - 1].players);
-      const dt = obs[j].t - obs[j - 1].t;
-      if (growth > 0.002 && dt > 0) lagSamples.push({ value: Math.max(0, Math.min(1, -(obs[j].y - obs[j - 1].y) / growth)), weight: Math.exp(-(latest - obs[j].t) / 35) });
+  function curveFor(rateAt: (row: typeof rows[number]) => number | null): Curve {
+    const observations: { t: number; p: number; n: number; z: number; noise: number }[] = [];
+    for (const row of rows) {
+      const rate = rateAt(row);
+      if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 100) continue;
+      // Jeffreys smoothing keeps observed 0%/100% finite on the logit scale.
+      const p = (row.players_tracked * rate / 100 + 0.5) / (row.players_tracked + 1);
+      observations.push({ t: row.t, p, n: row.players_tracked, z: logit(p),
+        noise: 1 / Math.max(0.25, row.players_tracked * p * (1 - p)) });
     }
-    const lag = lagSamples.length ? Math.max(0.12, Math.min(0.65, 0.2 + 0.25 * weightedMedian(lagSamples))) : 0.2;
-    // The historical slope contains dilution already. Remove that component
-    // before extrapolating the underlying curve, then apply expected future
-    // tracker growth once below.
-    const underlyingSlope = slope + reliability * lag * Math.max(0, playerGrowth);
-    const dilution = -lag * Math.max(0, playerGrowth);
-    const p = prior(t);
-    const priorSpeed = p.speed * p.secret;
-    const effectiveSpeed = 1 + (priorSpeed - 1) * (1 - reliability);
-    const population = populationSlope * priorSpeed;
-    const blended = underlyingSlope * effectiveSpeed + (population - underlyingSlope * effectiveSpeed) * (1 - reliability) * 0.2;
-    const floor = Math.max(0, 1.1 - current) * p.floor;
-    const ceiling = Math.max(0, current - 85) * p.ceiling;
-    const drift = blended + dilution * (1 - reliability) + floor + ceiling;
-    const median = logit(current) + drift * horizon;
-    const sigma = Math.max(0.12, Math.min(0.8, 0.08 + residual * 0.55 + (obs.length < 3 ? 0.12 : 0)));
-    // The fitted increment variance includes level-fit uncertainty; discount
-    // that component before turning it into a future process spread.
-    const spread = 0.72 * Math.sqrt(sigma * sigma * horizon + 0.0144 * horizon + 0.04);
-    const q = Z.map((z) => round4(logistic(median + z * spread)));
-    return { id: t.id, q };
+    if (!observations.length) return { last: lastTime,
+      fit: fitLine([]), samplingVariance: 0.5 };
+    const latest = observations[observations.length - 1];
+    let dilutionOffset = 0;
+    const adjusted = observations.map((o, i) => {
+      if (i > 0) {
+        const previous = observations[i - 1];
+        // d(logit p)/dt = intrinsic drift - d(log N)/dt / (1-p).
+        dilutionOffset += Math.log(o.n / previous.n) *
+          0.5 * (1 / Math.max(0.025, 1 - previous.p) + 1 / Math.max(0.025, 1 - o.p));
+      }
+      return { t: o.t - latest.t, y: o.z + dilutionOffset,
+        weight: weightAt(o.t), noise: o.noise };
+    });
+    const fit = fitLine(adjusted);
+    // Fit the drift, but anchor forecasts to the latest actual observed rarity.
+    fit.intercept = latest.z;
+    return { last: latest.t, fit, samplingVariance: latest.noise };
+  }
+
+  const population = curveFor(row => {
+    const observed = input.trophies.map((_, i) => row.rates[i])
+      .filter((r): r is number => typeof r === 'number' && Number.isFinite(r) && r >= 0 && r <= 100);
+    return observed.length ? median(observed) : null;
   });
+  const typicalPrior = median(input.trophies.map(driftPrior)) || 0.12;
+  const populationStrength = population.fit.count / (population.fit.count + 2) *
+    population.fit.span / (population.fit.span + 0.5);
+  const populationDrift = clamp(populationStrength * population.fit.slope +
+    (1 - populationStrength) * typicalPrior, -2, 4);
+  const trendMemory = Math.max(5, span * 2);
+  const growthMemory = Math.max(7, span * 2);
+
+  // Exact logistic and dilution substeps avoid unstable logits near 100%.
+  function advance(z: number, drift: number, dilution: number, dt: number): number {
+    const halfDiluted = clamp(logistic(z) * Math.exp(-dilution * dt / 2), EPSILON, 1 - EPSILON);
+    const acquired = logistic(logit(halfDiluted) + drift * dt);
+    return logit(clamp(acquired * Math.exp(-dilution * dt / 2), EPSILON, 1 - EPSILON));
+  }
+
+  return { trophies: input.trophies.map((trophy, index) => {
+    const curve = curveFor(row => row.rates[index] ?? null);
+    const fit = curve.fit;
+    const prior = 0.7 * populationDrift + 0.3 * driftPrior(trophy);
+    const information = fit.count / (fit.count + 1.5) * fit.span / (fit.span + 0.25) /
+      (1 + fit.slopeVariance / (0.3 ** 2));
+    const intrinsicDrift = clamp(information * fit.slope + (1 - information) * prior, -2, 4);
+    const elapsed = Math.max(0, horizon - curve.last);
+    const steps = Math.max(1, Math.min(2048, Math.ceil(elapsed * 48)));
+    const dt = elapsed / steps;
+    let z = fit.count ? fit.intercept : logit(0.01);
+    let center = population.fit.count ? population.fit.intercept : logit(0.1);
+    // Align the population reference with a trophy whose last valid rate is older.
+    if (curve.last < population.last) {
+      center -= population.fit.slope * (population.last - curve.last);
+    }
+    for (let step = 0; step < steps; step++) {
+      const age = (step + 0.5) * dt;
+      const futureAge = Math.max(0, curve.last + age);
+      const dilution = growth * Math.exp(-futureAge / growthMemory);
+      const fadingDrift = prior + (intrinsicDrift - prior) * Math.exp(-age / trendMemory);
+      const gap = center - z;
+      const reversion = 0.035 * gap / (1 + Math.abs(gap));
+      z = advance(z, fadingDrift + reversion, dilution, dt);
+      center = advance(center, populationDrift, dilution, dt);
+    }
+    const effectiveHorizon = trendMemory * (-Math.expm1(-elapsed / trendMemory));
+    const residual = Math.sqrt(fit.residualVariance);
+    const driftUncertainty = Math.sqrt(fit.slopeVariance + (1 - information) * 0.08 ** 2);
+    const processVariance = (0.04 ** 2 + 0.2 * fit.residualVariance) * elapsed;
+    const uncertainty = Math.sqrt(
+      curve.samplingVariance + fit.residualVariance +
+      (driftUncertainty * effectiveHorizon) ** 2 + processVariance +
+      (residual * Math.sqrt(elapsed / Math.max(0.25, fit.cadence)) * 0.3) ** 2 +
+      (0.08 * Math.log1p(elapsed) * (1 + Math.abs(growth))) ** 2
+    );
+    const q = NORMAL_QUANTILES.map(normal => {
+      const percent = 100 * logistic(z + normal * uncertainty);
+      return Math.round(clamp(percent, 0, 100) * 1e6) / 1e6;
+    });
+    return { id: trophy.id, q };
+  }) };
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-for (const file of readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort()) {
-  const id = file.slice(0, -3);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ trophies: forecast(c) })}\n`);
+async function main(): Promise<void> {
+  const inputDirectory = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+  const outputDirectory = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  const entries = (await readdir(inputDirectory, { withFileTypes: true }))
+    .filter(entry => entry.isFile() && entry.name.endsWith('.in'))
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  await mkdir(outputDirectory, { recursive: true });
+  for (const entry of entries) {
+    try {
+      const input = JSON.parse(await readFile(join(inputDirectory, entry.name), 'utf8')) as ForecastCase;
+      const result = forecast(input);
+      const serialized = JSON.stringify(result) + '\n';
+      if (Buffer.byteLength(serialized, 'utf8') > 65536) throw new Error('Output exceeds 65536 bytes');
+      for (const row of result.trophies) {
+        if (row.q.length !== 5 || row.q.some((value, i) => !Number.isFinite(value) ||
+            value < 0 || value > 100 || (i > 0 && value < row.q[i - 1]))) {
+          throw new Error('Invalid quantile output');
+        }
+      }
+      await writeFile(join(outputDirectory, `${entry.name.slice(0, -3)}.out`), serialized, 'utf8');
+    } catch (error) {
+      process.stderr.write(`${entry.name}: ${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+  }
 }
+
+main().catch(error => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});
